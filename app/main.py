@@ -22,9 +22,10 @@ def health():
     return {
         "status": "healthy",
         "version": APP_VERSION
+
     }
 
 
 @app.get("/version")
 def version():
-    return {"version": APP_VERSION}
+    return {"version": "broken"}
