@@ -50,6 +50,14 @@ jobs:
           ignore-unfixed: true
           vuln-type: os,library
           severity: CRITICAL,HIGH
+          
+      - name: Debug GitHub OIDC context
+        if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+        run: |
+          echo "Repository: $GITHUB_REPOSITORY"
+          echo "Ref: $GITHUB_REF"
+          echo "Event: $GITHUB_EVENT_NAME"
+          echo "OIDC permission: configured in workflow"   
 
       - name: Configure AWS credentials using OIDC
         if: github.event_name == 'push' && github.ref == 'refs/heads/main'
