@@ -161,6 +161,13 @@ jobs:
 
           rollback
           REMOTE
+          
+          {
+           printf 'export IMAGE_URI=%q\n' "$IMAGE_URI"
+           cat remote-deploy.sh
+          } > remote-deploy-with-env.sh
+
+          mv remote-deploy-with-env.sh remote-deploy.sh
 
           ENCODED_SCRIPT=$(base64 -w0 remote-deploy.sh)
           jq -n --arg encoded "$ENCODED_SCRIPT" \
