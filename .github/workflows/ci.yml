@@ -112,41 +112,53 @@ jobs:
 
           PREVIOUS_IMAGE=$(docker inspect --format '{{.Config.Image}}' resilientdeploy 2>/dev/null)
           if [ -z "$PREVIOUS_IMAGE" ]; then
-            echo "ERROR: Cannot identify the current image. Leaving deployment untouched."
+            echo "ERROR: Cannot identify previous image. Aborting."
             exit 1
           fi
           echo "Previous image: $PREVIOUS_IMAGE"
+          echo "New image: $IMAGE_URI"
 
           if ! aws ecr get-login-password --region ap-south-1 | docker login --username AWS --password-stdin "$REGISTRY"; then
-            echo "ERROR: ECR login failed. Existing container was not stopped."
+            echo "ERROR: ECR login failed. Existing app left untouched."
             exit 1
           fi
 
           if ! docker pull "$IMAGE_URI"; then
-            echo "ERROR: New image pull failed. Existing container was not stopped."
+            echo "ERROR: Image pull failed. Existing app left untouched."
             exit 1
           fi
 
+          check_health() {
+            curl --fail --silent --show-error \
+              --retry 15 --retry-delay 2 --retry-connrefused --retry-all-errors \
+              --max-time 5 http://localhost:8000/health
+          }
+
           rollback() {
-            echo "Deployment failed. Rolling back to $PREVIOUS_IMAGE"
+            echo "Deployment failed. New container diagnostics:"
+            docker logs --tail 80 resilientdeploy 2>&1 || true
+            echo "Rolling back to $PREVIOUS_IMAGE"
+
             docker rm -f resilientdeploy >/dev/null 2>&1 || true
 
             if ! docker run -d --name resilientdeploy --restart unless-stopped -p 8000:8000 "$PREVIOUS_IMAGE"; then
-              echo "CRITICAL: Could not start the previous image."
+              echo "CRITICAL: Previous container could not start."
               exit 2
             fi
 
-            if curl --fail --silent --show-error --retry 10 --retry-delay 3 --retry-connrefused http://localhost:8000/health; then
+            sleep 5
+            if check_health; then
               echo "Rollback successful. Previous app is healthy."
               exit 1
             fi
 
-            echo "CRITICAL: Rollback started but health check failed."
+            echo "CRITICAL: Rollback health check failed."
+            docker logs --tail 80 resilientdeploy 2>&1 || true
             exit 2
           }
 
           if ! docker rm -f resilientdeploy; then
-            echo "ERROR: Could not remove the old container; refusing to deploy."
+            echo "ERROR: Could not remove old container."
             exit 1
           fi
 
@@ -154,19 +166,20 @@ jobs:
             rollback
           fi
 
-          if curl --fail --silent --show-error --retry 10 --retry-delay 3 --retry-connrefused http://localhost:8000/health; then
+          sleep 5
+          if check_health; then
             echo "Deployment successful."
             exit 0
           fi
 
+          echo "New deployment health check failed."
           rollback
           REMOTE
-          
-          {
-           printf 'export IMAGE_URI=%q\n' "$IMAGE_URI"
-           cat remote-deploy.sh
-          } > remote-deploy-with-env.sh
 
+          {
+            printf 'export IMAGE_URI=%q\n' "$IMAGE_URI"
+            cat remote-deploy.sh
+          } > remote-deploy-with-env.sh
           mv remote-deploy-with-env.sh remote-deploy.sh
 
           ENCODED_SCRIPT=$(base64 -w0 remote-deploy.sh)
@@ -215,5 +228,6 @@ jobs:
 
           echo "Timed out waiting for deployment."
           exit 1
+
          
       
