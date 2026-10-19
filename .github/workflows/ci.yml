@@ -96,7 +96,7 @@ jobs:
         run: |
           docker tag resilientdeploy:${IMAGE_TAG} ${REGISTRY}/${ECR_REPOSITORY}:${IMAGE_TAG}
           docker push ${REGISTRY}/${ECR_REPOSITORY}:${IMAGE_TAG}
-               
+      
       - name: Deploy to EC2 using SSM
         if: github.event_name == 'push' && github.ref == 'refs/heads/main'
         env:
@@ -104,30 +104,68 @@ jobs:
           INSTANCE_ID: i-08119269b7a71027d
           IMAGE_URI: 965984381610.dkr.ecr.ap-south-1.amazonaws.com/resilientdeploy:${{ github.sha }}
         run: |
-          jq -n \
-            --arg image "$IMAGE_URI" \
-            --arg region "$AWS_REGION" \
-            '{
-              commands: [
-                "set -eu",
-                "aws ecr get-login-password --region \($region) | docker login --username AWS --password-stdin 965984381610.dkr.ecr.ap-south-1.amazonaws.com",
-                "PREVIOUS_IMAGE=$(docker inspect --format \"{{.Config.Image}}\" resilientdeploy)",
-                "echo Previous image: $PREVIOUS_IMAGE",
-                "docker pull \($image)",
-                "docker stop resilientdeploy || true",
-                "docker rm resilientdeploy || true",
-                "DEPLOY_FAILED=0",
-                "docker run -d --name resilientdeploy --restart unless-stopped -p 8000:8000 \($image) || DEPLOY_FAILED=1",
-                "if [ \"$DEPLOY_FAILED\" -eq 0 ]; then sleep 5; if curl --fail --retry 10 --retry-delay 3 --retry-connrefused http://localhost:8000/health; then echo Deployment successful; exit 0; fi; fi",
-                "echo New deployment failed; rolling back to $PREVIOUS_IMAGE",
-                "docker rm -f resilientdeploy || true",
-                "docker run -d --name resilientdeploy --restart unless-stopped -p 8000:8000 \"$PREVIOUS_IMAGE\"",
-                "sleep 5",
-                "curl --fail --retry 10 --retry-delay 3 --retry-connrefused http://localhost:8000/health",
-                "echo Rollback completed; marking deployment as failed",
-                "exit 1"
-              ]
-            }' > ssm-commands.json
+          cat > remote-deploy.sh <<'REMOTE'
+          #!/bin/bash
+          set +e
+
+          REGISTRY="965984381610.dkr.ecr.ap-south-1.amazonaws.com"
+
+          PREVIOUS_IMAGE=$(docker inspect --format '{{.Config.Image}}' resilientdeploy 2>/dev/null)
+          if [ -z "$PREVIOUS_IMAGE" ]; then
+            echo "ERROR: Cannot identify the current image. Leaving deployment untouched."
+            exit 1
+          fi
+          echo "Previous image: $PREVIOUS_IMAGE"
+
+          if ! aws ecr get-login-password --region ap-south-1 | docker login --username AWS --password-stdin "$REGISTRY"; then
+            echo "ERROR: ECR login failed. Existing container was not stopped."
+            exit 1
+          fi
+
+          if ! docker pull "$IMAGE_URI"; then
+            echo "ERROR: New image pull failed. Existing container was not stopped."
+            exit 1
+          fi
+
+          rollback() {
+            echo "Deployment failed. Rolling back to $PREVIOUS_IMAGE"
+            docker rm -f resilientdeploy >/dev/null 2>&1 || true
+
+            if ! docker run -d --name resilientdeploy --restart unless-stopped -p 8000:8000 "$PREVIOUS_IMAGE"; then
+              echo "CRITICAL: Could not start the previous image."
+              exit 2
+            fi
+
+            if curl --fail --silent --show-error --retry 10 --retry-delay 3 --retry-connrefused http://localhost:8000/health; then
+              echo "Rollback successful. Previous app is healthy."
+              exit 1
+            fi
+
+            echo "CRITICAL: Rollback started but health check failed."
+            exit 2
+          }
+
+          if ! docker rm -f resilientdeploy; then
+            echo "ERROR: Could not remove the old container; refusing to deploy."
+            exit 1
+          fi
+
+          if ! docker run -d --name resilientdeploy --restart unless-stopped -p 8000:8000 "$IMAGE_URI"; then
+            rollback
+          fi
+
+          if curl --fail --silent --show-error --retry 10 --retry-delay 3 --retry-connrefused http://localhost:8000/health; then
+            echo "Deployment successful."
+            exit 0
+          fi
+
+          rollback
+          REMOTE
+
+          ENCODED_SCRIPT=$(base64 -w0 remote-deploy.sh)
+          jq -n --arg encoded "$ENCODED_SCRIPT" \
+            '{commands: ["echo " + ($encoded | @sh) + " | base64 -d | bash"]}' \
+            > ssm-commands.json
 
           COMMAND_ID=$(aws ssm send-command \
             --region "$AWS_REGION" \
@@ -170,3 +208,5 @@ jobs:
 
           echo "Timed out waiting for deployment."
           exit 1
+         
+      
