@@ -96,7 +96,7 @@ jobs:
         run: |
           docker tag resilientdeploy:${IMAGE_TAG} ${REGISTRY}/${ECR_REPOSITORY}:${IMAGE_TAG}
           docker push ${REGISTRY}/${ECR_REPOSITORY}:${IMAGE_TAG}
-          
+               
       - name: Deploy to EC2 using SSM
         if: github.event_name == 'push' && github.ref == 'refs/heads/main'
         env:
@@ -109,13 +109,23 @@ jobs:
             --arg region "$AWS_REGION" \
             '{
               commands: [
+                "set -eu",
                 "aws ecr get-login-password --region \($region) | docker login --username AWS --password-stdin 965984381610.dkr.ecr.ap-south-1.amazonaws.com",
+                "PREVIOUS_IMAGE=$(docker inspect --format \"{{.Config.Image}}\" resilientdeploy)",
+                "echo Previous image: $PREVIOUS_IMAGE",
                 "docker pull \($image)",
                 "docker stop resilientdeploy || true",
                 "docker rm resilientdeploy || true",
-                "docker run -d --name resilientdeploy --restart unless-stopped -p 8000:8000 \($image)",
+                "DEPLOY_FAILED=0",
+                "docker run -d --name resilientdeploy --restart unless-stopped -p 8000:8000 \($image) || DEPLOY_FAILED=1",
+                "if [ \"$DEPLOY_FAILED\" -eq 0 ]; then sleep 5; if curl --fail --retry 10 --retry-delay 3 --retry-connrefused http://localhost:8000/health; then echo Deployment successful; exit 0; fi; fi",
+                "echo New deployment failed; rolling back to $PREVIOUS_IMAGE",
+                "docker rm -f resilientdeploy || true",
+                "docker run -d --name resilientdeploy --restart unless-stopped -p 8000:8000 \"$PREVIOUS_IMAGE\"",
                 "sleep 5",
-                "curl --fail --retry 10 --retry-delay 3 --retry-connrefused http://localhost:8000/health"
+                "curl --fail --retry 10 --retry-delay 3 --retry-connrefused http://localhost:8000/health",
+                "echo Rollback completed; marking deployment as failed",
+                "exit 1"
               ]
             }' > ssm-commands.json
 
@@ -160,4 +170,3 @@ jobs:
 
           echo "Timed out waiting for deployment."
           exit 1
-
