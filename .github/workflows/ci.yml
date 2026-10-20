@@ -8,6 +8,13 @@ on:
   pull_request:
     branches:
       - main
+  workflow_dispatch:
+    inputs:
+      rollback_test:
+        description: "Test deployment rollback"
+        required: false
+        type: boolean
+        default: false
 
 permissions:
   contents: read
@@ -83,12 +90,12 @@ jobs:
           aws-region: ${{ vars.AWS_REGION }}
 
       - name: Log in to Amazon ECR
-        if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+        if: (github.event_name == 'push' && github.ref == 'refs/heads/main') || (github.event_name == 'workflow_dispatch' && github.ref == 'refs/heads/main')
         id: login-ecr
         uses: aws-actions/amazon-ecr-login@v2
 
       - name: Push image to Amazon ECR
-        if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+        if: (github.event_name == 'push' && github.ref == 'refs/heads/main') || (github.event_name == 'workflow_dispatch' && github.ref == 'refs/heads/main')
         env:
           REGISTRY: ${{ steps.login-ecr.outputs.registry }}
           IMAGE_TAG: ${{ github.sha }}
@@ -97,13 +104,17 @@ jobs:
           docker tag resilientdeploy:${IMAGE_TAG} ${REGISTRY}/${ECR_REPOSITORY}:${IMAGE_TAG}
           docker push ${REGISTRY}/${ECR_REPOSITORY}:${IMAGE_TAG}
       
+      
       - name: Deploy to EC2 using SSM
-        if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+        if: (github.event_name == 'push' && github.ref == 'refs/heads/main') || (github.event_name == 'workflow_dispatch' && github.ref == 'refs/heads/main')
         env:
           AWS_REGION: ${{ vars.AWS_REGION }}
           INSTANCE_ID: i-08119269b7a71027d
           IMAGE_URI: 965984381610.dkr.ecr.ap-south-1.amazonaws.com/resilientdeploy:${{ github.sha }}
+          ROLLBACK_TEST: ${{ inputs.rollback_test && 'true' || 'false' }}
         run: |
+          set -euo pipefail
+
           cat > remote-deploy.sh <<'REMOTE'
           #!/bin/bash
           set +e
@@ -115,10 +126,13 @@ jobs:
             echo "ERROR: Cannot identify previous image. Aborting."
             exit 1
           fi
+
           echo "Previous image: $PREVIOUS_IMAGE"
           echo "New image: $IMAGE_URI"
+          echo "Rollback test mode: $ROLLBACK_TEST"
 
-          if ! aws ecr get-login-password --region ap-south-1 | docker login --username AWS --password-stdin "$REGISTRY"; then
+          if ! aws ecr get-login-password --region "$AWS_REGION" |
+               docker login --username AWS --password-stdin "$REGISTRY"; then
             echo "ERROR: ECR login failed. Existing app left untouched."
             exit 1
           fi
@@ -134,26 +148,45 @@ jobs:
               --max-time 5 http://localhost:8000/health
           }
 
+          check_new_health() {
+            if [ "$ROLLBACK_TEST" = "true" ]; then
+              # Temporary test: deliberately fail the new deployment check.
+              curl --fail --silent --show-error \
+                --max-time 5 http://localhost:8000/health-tesr
+            else
+              curl --fail --silent --show-error \
+                --retry 15 --retry-delay 2 --retry-connrefused --retry-all-errors \
+                --max-time 5 http://localhost:8000/health
+            fi
+          }
+
           rollback() {
-            echo "Deployment failed. New container diagnostics:"
-            docker logs --tail 80 resilientdeploy 2>&1 || true
+            echo "Deployment failed. Collecting new container diagnostics:"
+            docker logs --tail 30 resilientdeploy 2>&1 || true
             echo "Rolling back to $PREVIOUS_IMAGE"
 
             docker rm -f resilientdeploy >/dev/null 2>&1 || true
 
-            if ! docker run -d --name resilientdeploy --restart unless-stopped -p 8000:8000 "$PREVIOUS_IMAGE"; then
+            if ! docker run -d --name resilientdeploy \
+                 --restart unless-stopped -p 8000:8000 "$PREVIOUS_IMAGE"; then
               echo "CRITICAL: Previous container could not start."
               exit 2
             fi
 
-            sleep 5
+            echo "Checking restored application health..."
             if check_health; then
               echo "Rollback successful. Previous app is healthy."
+
+              if [ "$ROLLBACK_TEST" = "true" ]; then
+                echo "ROLLBACK_TEST_PASSED: Previous image restored and healthy."
+              fi
+
+              # Nonzero tells the deployment step the new deployment failed.
               exit 1
             fi
 
             echo "CRITICAL: Rollback health check failed."
-            docker logs --tail 80 resilientdeploy 2>&1 || true
+            docker logs --tail 30 resilientdeploy 2>&1 || true
             exit 2
           }
 
@@ -162,12 +195,15 @@ jobs:
             exit 1
           fi
 
-          if ! docker run -d --name resilientdeploy --restart unless-stopped -p 8000:8000 "$IMAGE_URI"; then
+          if ! docker run -d --name resilientdeploy \
+               --restart unless-stopped -p 8000:8000 "$IMAGE_URI"; then
             rollback
           fi
 
+          echo "Waiting for new deployment health check..."
           sleep 5
-          if check_health; then
+
+          if check_new_health; then
             echo "Deployment successful."
             exit 0
           fi
@@ -178,6 +214,8 @@ jobs:
 
           {
             printf 'export IMAGE_URI=%q\n' "$IMAGE_URI"
+            printf 'export AWS_REGION=%q\n' "$AWS_REGION"
+            printf 'export ROLLBACK_TEST=%q\n' "$ROLLBACK_TEST"
             cat remote-deploy.sh
           } > remote-deploy-with-env.sh
           mv remote-deploy-with-env.sh remote-deploy.sh
@@ -198,27 +236,36 @@ jobs:
           echo "SSM deployment command: $COMMAND_ID"
 
           for attempt in $(seq 1 30); do
-            STATUS=$(aws ssm get-command-invocation \
+            INVOCATION=$(aws ssm get-command-invocation \
               --region "$AWS_REGION" \
               --command-id "$COMMAND_ID" \
               --instance-id "$INSTANCE_ID" \
-              --query 'Status' \
-              --output text 2>/dev/null || true)
+              --output json 2>/dev/null || true)
+
+            STATUS=$(printf '%s' "$INVOCATION" |
+              jq -r '.Status // "Pending"')
 
             echo "Deployment status: $STATUS"
 
             case "$STATUS" in
               Success)
-                echo "Deployment completed successfully!"
+                echo "Deployment completed successfully."
                 exit 0
                 ;;
               Failed|Cancelled|TimedOut)
-                aws ssm get-command-invocation \
-                  --region "$AWS_REGION" \
-                  --command-id "$COMMAND_ID" \
-                  --instance-id "$INSTANCE_ID" \
-                  --query '{Status:Status,Output:StandardOutputContent,Errors:StandardErrorContent}' \
-                  --output json
+                printf '%s\n' "$INVOCATION" |
+                  jq '{Status, ResponseCode, Output: .StandardOutputContent, Errors: .StandardErrorContent}'
+
+                STDOUT=$(printf '%s' "$INVOCATION" |
+                  jq -r '.StandardOutputContent // ""')
+
+                if [ "$ROLLBACK_TEST" = "true" ] &&
+                   [[ "$STDOUT" == *"ROLLBACK_TEST_PASSED"* ]]; then
+                  echo "Rollback test passed: previous application restored and healthy."
+                  exit 0
+                fi
+
+                echo "Deployment or rollback failed. Inspect the SSM output above."
                 exit 1
                 ;;
             esac
@@ -226,7 +273,7 @@ jobs:
             sleep 10
           done
 
-          echo "Timed out waiting for deployment."
+          echo "Timed out waiting for SSM. Check the command status before retrying."
           exit 1
 
          
