@@ -1,206 +1,176 @@
-# BusinessDoc AI
-### AI-Powered Invoice and Purchase Order Reconciliation
+# ResilientDeploy 🚀
 
-BusinessDoc AI is a Python-based application that automates the comparison of invoices and purchase orders using document processing, rule-based validation, and Amazon Bedrock generative AI.
+**An AWS-based CI/CD pipeline with Docker, automated testing, security scanning, health checks, and rollback for failed deployments.**
 
-It identifies discrepancies between business documents and generates clear, AI-powered explanations to help users understand issues that may require attention.
+## 📌 Project Overview
 
-## Problem Statement
+ResilientDeploy automates the process of testing, packaging, and deploying a Python FastAPI application to an AWS EC2 instance.
 
-Businesses regularly process invoices against purchase orders. Manually checking every field and product entry can be time-consuming and may lead to overlooked discrepancies.
+The project demonstrates how DevOps practices can reduce manual deployment work and improve recovery when a new application release fails its health check.
 
-BusinessDoc AI helps simplify this process by automatically extracting information, comparing important fields, identifying mismatches, and generating explanations.
+The deployment pipeline uses GitHub Actions to run automated tests, build a Docker image, scan it for known vulnerabilities, push the image to Amazon Elastic Container Registry (ECR), and deploy it to EC2 through AWS Systems Manager (SSM).
 
-## Key Features
+A rollback mechanism attempts to restore the previously running image if the new deployment fails its health check.
 
-- Upload invoice and purchase order PDFs.
-- Extract document information using PyMuPDF.
-- Compare supplier, buyer, dates, totals, and product details.
-- Identify missing products and mismatched values.
-- Generate plain-language discrepancy explanations using Amazon Bedrock.
-- Generate a downloadable PDF reconciliation report.
-- Run the application locally or using Docker.
+## 🎯 Problem Statement
 
-## Technology Stack
+Manual deployments can be time-consuming and error-prone. A newly deployed application may also start incorrectly or fail its health check, potentially interrupting service.
+
+ResilientDeploy addresses these challenges by automating deployment steps and testing a recovery mechanism that attempts to restore the previous application version when a deployment fails.
+
+## 🏗️ Architecture
+
+```text
+Developer pushes code to GitHub
+              |
+              v
+       GitHub Actions
+              |
+       +------+------+
+       |      |      |
+     Tests  Docker  Trivy
+       |    Build   Scan
+       +------+------+
+              |
+              v
+       AWS Authentication
+       GitHub OIDC + IAM
+              |
+              v
+        Amazon ECR
+       Store Docker Image
+              |
+              v
+       AWS Systems Manager
+          Run Command
+              |
+              v
+          Amazon EC2
+        Ubuntu + Docker
+              |
+              v
+       Start New Container
+              |
+              v
+        Health Check
+          /       \
+       Pass       Fail
+        |           |
+     Success    Attempt Rollback
+                    |
+                    v
+           Check Previous Version
+```
+
+## 🛠️ Technologies Used
 
 | Technology | Purpose |
 |---|---|
-| Python | Core application logic |
-| Streamlit | Web application interface |
-| PyMuPDF | PDF text extraction |
-| Pandas | Data handling |
-| Amazon Bedrock | AI-powered explanations |
-| Amazon Nova 2 Lite | Generative AI model |
-| Boto3 | AWS service integration |
-| ReportLab | PDF report generation |
-| Pytest | Unit testing |
-| Docker | Application containerization |
-| Git & GitHub | Version control and source code hosting |
+| Python | Application programming language |
+| FastAPI | REST API framework |
+| Docker | Containerization |
+| Git and GitHub | Source control |
+| GitHub Actions | CI/CD automation |
+| pytest | Automated application tests |
+| Trivy | Container vulnerability scanning |
+| AWS IAM and OIDC | Secure authentication and permissions |
+| Amazon ECR | Docker image registry |
+| Amazon EC2 | Application hosting |
+| AWS Systems Manager (SSM) | Remote deployment command execution |
+| Ubuntu Linux | Server operating system |
+| Bash | Deployment and rollback scripting |
 
-## How It Works
+## ⚙️ CI/CD Pipeline
 
-1. **Document Upload:** User uploads an invoice PDF and a purchase order PDF.
-2. **Text Extraction:** PyMuPDF extracts text from both documents.
-3. **Data Processing:** Extracted information is organized into structured fields.
-4. **Reconciliation:** Python validation logic compares the extracted information.
-5. **Discrepancy Detection:** Mismatches are identified and displayed.
-6. **AI Explanation:** Amazon Bedrock generates a business-friendly explanation of the detected discrepancies.
-7. **Report Generation:** A downloadable PDF report summarizes the reconciliation results.
+The GitHub Actions workflow automates the following stages:
 
-### Important Design Principle
+1. **Checkout:** Retrieves the source code from the repository.
+2. **Testing:** Installs development dependencies and runs pytest.
+3. **Docker build:** Builds a container image for the application.
+4. **Security scanning:** Uses Trivy to identify known vulnerabilities in the image.
+5. **AWS authentication:** Uses GitHub OIDC to obtain temporary AWS credentials through an IAM role.
+6. **Image publishing:** Pushes the Docker image to Amazon ECR, tagged with the Git commit SHA.
+7. **Deployment:** Uses AWS Systems Manager Run Command to execute a deployment script on EC2.
+8. **Health verification:** Checks the application's `/health` endpoint.
+9. **Rollback attempt:** If the new deployment fails its health check, attempts to restore the previous image and verify its health.
 
-Python-based validation rules determine whether information matches or differs. Amazon Bedrock is used to explain the detected discrepancies, not to make payment approval decisions.
+The deployment steps are configured for pushes to `main` and manual workflow runs on `main`. Pull requests run the configured CI checks without deploying the application.
 
-## Project Structure
+## 🔄 Rollback Mechanism
 
-```text
-BusinessDoc-AI/
-│
-├── .dockerignore
-├── .gitignore
-├── Dockerfile
-├── README.md
-├── app.py
-├── requirements.txt
-│
-├── sample_documents/
-│   ├── sample_invoice.pdf
-│   └── sample_purchase_order.pdf
-│
-├── src/
-│   ├── __init__.py
-│   ├── bedrock_explainer.py
-│   ├── pdf_extractor.py
-│   ├── reconciler.py
-│   └── report_generator.py
-│
-└── tests/
-    └── test_reconciler.py
+Before replacing the running container, the deployment script records the image reference used by the existing container and pulls the new image.
+
+After starting the new container, it checks the application's health endpoint.
+
+If the health check fails, the script attempts to:
+
+- Collect diagnostic logs from the failed container.
+- Remove the failed container.
+- Start a container using the previously recorded image.
+- Check whether the restored application is healthy.
+
+The manual `rollback_test` workflow input deliberately uses an invalid health-check path to simulate a failed deployment.
+
+**Verification:** The rollback test completed successfully, reporting that the previous application was restored and healthy. The EC2 container was subsequently observed running, and the health endpoint returned HTTP 200.
+
+> This is a single-instance deployment with a possible interruption during container replacement. Rollback is best-effort recovery, not a guarantee of zero downtime.
+
+## 🔐 Security Practices
+
+- Uses GitHub OIDC with AWS IAM roles instead of relying on long-lived AWS access keys in GitHub.
+- Uses IAM permissions to control access to AWS services.
+- Scans the Docker image using Trivy for known vulnerabilities.
+- Uses commit-SHA image tags to improve release traceability.
+- Keeps application deployment commands within the AWS Systems Manager workflow.
+
+**Security-scan limitation:** The current Trivy configuration reports matching CRITICAL and HIGH findings but uses `exit-code: '0'`. Therefore, those findings do not automatically fail the workflow. The scan is a visibility measure, not yet an enforced vulnerability gate.
+
+## 🧪 Application Endpoints
+
+| Endpoint | Description |
+|---|---|
+| `/` | Returns application information |
+| `/health` | Returns application health and version |
+| `/version` | Returns the application version |
+
+Example health response:
+
+```json
+{
+  "status": "healthy",
+  "version": "1.0.0"
+}
 ```
 
-## Local Setup
+## 📚 Key Learnings
 
-### 1. Clone the repository
+Through this project, I practised:
 
-```bash
-git clone https://github.com/AshishVittal/BusinessDoc-AI.git
-cd BusinessDoc-AI
-```
+- Building and testing a Python API.
+- Creating and running Docker images and containers.
+- Writing a GitHub Actions CI/CD workflow.
+- Using GitHub OIDC and AWS IAM roles for authentication.
+- Publishing Docker images to Amazon ECR.
+- Deploying applications to EC2 through AWS Systems Manager.
+- Writing Bash deployment scripts with health checks and rollback logic.
+- Testing a simulated deployment failure and verifying recovery.
+- Understanding the difference between successful deployment, health verification, and rollback recovery.
 
-### 2. Create a virtual environment
+## 🚀 Future Improvements
 
-```bash
-python -m venv .venv
-```
+- Enforce a defined security-vulnerability policy in CI.
+- Improve deployment diagnostics, alerting, and monitoring.
+- Add more robust recovery handling for edge cases.
+- Explore a multi-instance architecture with a load balancer to reduce deployment interruptions.
+- Add infrastructure provisioning using Terraform.
+- Improve automated integration and deployment tests.
 
-Activate it on Windows PowerShell:
+## 👨‍💻 Author
 
-```powershell
-.\.venv\Scripts\Activate.ps1
-```
+**Ashish Vittal**
 
-### 3. Install dependencies
+GitHub: [AshishVittal](https://github.com/AshishVittal)
 
-```bash
-pip install -r requirements.txt
-```
+---
 
-### 4. Configure AWS
-
-Configure AWS CLI credentials and ensure the AWS identity has permission to invoke the selected Amazon Bedrock model.
-
-Create a `.env` file in the project root:
-
-```env
-AWS_REGION=ap-south-1
-BEDROCK_MODEL_ID=global.amazon.nova-2-lite-v1:0
-```
-
-AWS credentials should be configured separately through the AWS CLI. Do not put access keys or secret keys in the `.env` file or commit credentials to GitHub.
-
-### 5. Run the application
-
-```bash
-streamlit run app.py
-```
-
-Open the local Streamlit URL displayed in the terminal, usually:
-
-```text
-http://localhost:8501
-```
-
-## Running Tests
-
-Run the test suite using:
-
-```bash
-python -m pytest -v
-```
-
-The reconciliation test suite has successfully passed all three tests:
-
-- `test_all_fields_match`
-- `test_delivery_date_mismatch`
-- `test_missing_product_is_detected`
-
-## Docker Setup
-
-Build the Docker image:
-
-```bash
-docker build -t businessdoc-ai .
-```
-
-Run the container on Windows PowerShell:
-
-```powershell
-docker run -d --name businessdoc-ai-container -p 8501:8501 --env-file .env -v "$env:USERPROFILE\.aws:/root/.aws:ro" -e AWS_PROFILE=default businessdoc-ai
-```
-
-The AWS credentials folder is mounted read-only so the container can use the configured AWS profile without copying credentials into the Docker image.
-
-Open:
-
-```text
-http://localhost:8501
-```
-
-## Sample Reconciliation Scenario
-
-The included fictional sample documents represent a purchase order and its corresponding invoice.
-
-| Field | Purchase Order | Invoice |
-|---|---|---|
-| PO Number | PO-2026-1042 | PO-2026-1042 |
-| Invoice Number | — | INV-2026-0881 |
-| Supplier | Northstar Office Supplies | Northstar Office Supplies |
-| Subtotal | INR 8,600 | INR 8,600 |
-| GST | INR 1,548 | INR 1,548 |
-| Total | INR 10,148 | INR 10,148 |
-| Expected Delivery Date | 20 November 2026 | 27 November 2026 |
-
-**Detected discrepancy:** The invoice lists a delivery date seven days later than the purchase order.
-
-The application identifies this mismatch and uses Amazon Bedrock to explain why it may require business review.
-
-## Limitations
-
-- Text extraction depends on the PDF containing readable text. Scanned documents requiring OCR are not currently supported.
-- The application uses predefined validation rules and extracted document fields.
-- AI-generated explanations should be reviewed by a human.
-- The application does not approve or reject payments.
-- AWS Bedrock usage may incur charges depending on usage and applicable pricing.
-
-## Future Improvements
-
-- Add OCR support for scanned documents.
-- Introduce persistent database storage for reconciliation history.
-- Add support for additional document formats.
-- Improve validation and error handling.
-- Deploy the application on AWS.
-- Add user authentication and access control.
-
-## Disclaimer
-
-This project is an educational portfolio project. The included sample documents contain fictional business information. Reconciliation results and AI-generated explanations are intended to assist human review and should not be treated as automatic financial approval decisions.
+*ResilientDeploy is a hands-on DevOps learning project demonstrating CI/CD automation, containerization, AWS deployment, security scanning, and deployment recovery.*
